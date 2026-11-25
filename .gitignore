@@ -1,0 +1,56 @@
+# ============================================================
+# 音乐分轨处理桌面应用 · Git 忽略规则
+# ============================================================
+
+# ---- 本地草稿区：虚拟环境、模型权重、第三方仓库克隆、轮子 ----
+# 体积达数百 MB ~ 数 GB，且 .scratch/tools/msst 内含独立 .git，绝不能入库
+.scratch/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---- 打包产物（开发计划 M1/M3）----
+build/
+dist/
+*.spec
+vendor/ffmpeg/
+
+# ---- 音频素材：体积大且涉用户版权，默认不入库 ----
+# 小型合成测试素材如确需入库，用 git add -f 显式添加
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.aac
+*.ogg
+*.aif
+*.aiff
+tests/fixtures/source/*
+!tests/fixtures/source/.gitkeep
+
+# ---- 应用运行期产物 ----
+exports/
+cache/
+*.bak
+*.log
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
