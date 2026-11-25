@@ -157,8 +157,9 @@ def _vram_sampler(stop: dict, result: dict) -> None:
 
 
 def config_variant(src: Path, out_dir: Path, chunk_s: float = 0.0, batch: int = 0,
-                   sample_rate: int = 44100, overlap: int = 0) -> Path:
-    """生成推理配置变体，用于在显存受限时覆盖 chunk_size / batch_size / num_overlap。
+                   sample_rate: int = 44100, overlap: int = 0, fp32: bool = False) -> Path:
+    """生成推理配置变体，用于在显存受限时覆盖 chunk_size / batch_size / num_overlap，
+    或把推理精度从 fp16 混合精度切到 fp32（提升弱源清晰度，代价是显存与耗时上升）。
 
     MSST 的配置里 chunk_size(采样数) 与 inference.batch_size 决定单次前向的音频量：
     DrumSep 默认 40 s × batch 8 = 320 s 音频，在 8 GB 卡上会打满显存并触发
@@ -167,7 +168,7 @@ def config_variant(src: Path, out_dir: Path, chunk_s: float = 0.0, batch: int = 
     num_overlap 影响分块重叠：demucs 对每个 chunk 独立做归一化，块与块之间的
     增益不一致会表现为"音量时大时小"，提高重叠可显著缓解（代价是耗时线性增加）。
     """
-    if not chunk_s and not batch and not overlap:
+    if not chunk_s and not batch and not overlap and not fp32:
         return src
 
     from omegaconf import OmegaConf
@@ -182,14 +183,18 @@ def config_variant(src: Path, out_dir: Path, chunk_s: float = 0.0, batch: int = 
         cfg.inference.batch_size = int(batch)
     if overlap:
         cfg.inference.num_overlap = int(overlap)
+    if fp32:
+        cfg.training.use_amp = False
     out_dir.mkdir(parents=True, exist_ok=True)
-    dst = out_dir / f"{src.stem}__c{chunk_s or 'def'}s_b{batch or 'def'}_o{overlap or 'def'}.yaml"
+    dst = out_dir / (f"{src.stem}__c{chunk_s or 'def'}s_b{batch or 'def'}"
+                     f"_o{overlap or 'def'}{'_fp32' if fp32 else ''}.yaml")
     OmegaConf.save(cfg, str(dst))
     return dst
 
 
 def run_msst(job: dict, src: Path, out_dir: Path, device: str = "cuda",
-             config_path: Path | None = None, tta: bool = False) -> dict:
+             config_path: Path | None = None, tta: bool = False,
+             bigshifts: int = 0) -> dict:
     # 所有传给 MSST 的路径必须是绝对路径：子进程的 cwd 会被切到 MSST 目录
     src = Path(src).resolve()
     out_dir = Path(out_dir).resolve()
@@ -218,6 +223,8 @@ def run_msst(job: dict, src: Path, out_dir: Path, device: str = "cuda",
         cmd += ["--device_ids", "0"]
     if tta:
         cmd.append("--use_tta")
+    if bigshifts and bigshifts > 1:
+        cmd += ["--bigshifts", str(int(bigshifts))]
     stop: dict = {}
     vram: dict = {}
     sampler = threading.Thread(target=_vram_sampler, args=(stop, vram), daemon=True)
@@ -259,6 +266,10 @@ def main() -> None:
                     help="阶段1 分块重叠次数（0=用配置默认；越大越平滑但越慢）")
     ap.add_argument("--stage1-tta", action="store_true",
                     help="阶段1 启用 TTA（时间平移测试增强，耗时翻倍、伪影更少）")
+    ap.add_argument("--stage1-fp32", action="store_true",
+                    help="阶段1 关闭 fp16 混合精度（use_amp=False），清晰度更好但更慢更占显存")
+    ap.add_argument("--stage1-bigshifts", type=int, default=0,
+                    help="阶段1 循环时移平均次数（>1 生效，耗时约线性增长、伪影更少）")
     ap.add_argument("--drumsep-chunk", type=float, default=0.0,
                     help="DrumSep 分块秒数（0=用配置默认；8 GB 显存建议 20）")
     ap.add_argument("--drumsep-batch", type=int, default=0,
@@ -306,16 +317,17 @@ def main() -> None:
             HTDEMUCS_6S["config"], out_root / "_configs",
             chunk_s=args.stage1_chunk, batch=args.stage1_batch,
             sample_rate=report["input"].get("sample_rate", 44100) or 44100,
-            overlap=args.stage1_overlap,
+            overlap=args.stage1_overlap, fp32=args.stage1_fp32,
         )
         if cfg1 != HTDEMUCS_6S["config"]:
             print(f"[m0] 阶段1 使用降配配置: {cfg1.name}")
         res1 = run_msst(HTDEMUCS_6S, src, out_root / "stage1_htdemucs_6s",
                         device=report["env"]["device_used"], config_path=cfg1,
-                        tta=args.stage1_tta)
+                        tta=args.stage1_tta, bigshifts=args.stage1_bigshifts)
         res1["config_used"] = str(cfg1)
         res1["override"] = {"chunk_s": args.stage1_chunk, "batch": args.stage1_batch,
-                            "overlap": args.stage1_overlap, "tta": args.stage1_tta}
+                            "overlap": args.stage1_overlap, "tta": args.stage1_tta,
+                            "fp32": args.stage1_fp32, "bigshifts": args.stage1_bigshifts}
         report["htdemucs_6s"] = res1
         print(f"[m0]   完成: {res1['wall_s']} s（含模型加载），显存峰值约 {res1['vram_used_peak_mb']} MB")
         for f in res1["files"]:
