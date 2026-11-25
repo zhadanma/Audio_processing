@@ -1,0 +1,54 @@
+﻿{
+  "env": {
+    "python": "3.12.15",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "torch": "2.14.1+cu130",
+    "torch_cuda": "13.0",
+    "cuda_available": true,
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "vram_gb": 8.0,
+    "device_used": "cuda",
+    "audio_output": "扬声器 (Realtek(R) Audio)"
+  },
+  "input": {
+    "path": "songs\\BENI - 瞳をとじて.mp3",
+    "duration_s": 340.5,
+    "sample_rate": 44100,
+    "channels": 2
+  },
+  "htdemucs_6s": {
+    "model": "htdemucs_6s",
+    "wall_s": 52.3,
+    "vram_used_peak_mb": 6726,
+    "files": [
+      ".scratch\\m0\\stage1_htdemucs_6s\\stems\\bass.wav",
+      ".scratch\\m0\\stage1_htdemucs_6s\\stems\\drums.wav",
+      ".scratch\\m0\\stage1_htdemucs_6s\\stems\\guitar.wav",
+      ".scratch\\m0\\stage1_htdemucs_6s\\stems\\other.wav",
+      ".scratch\\m0\\stage1_htdemucs_6s\\stems\\piano.wav",
+      ".scratch\\m0\\stage1_htdemucs_6s\\stems\\vocals.wav"
+    ],
+    "config_used": ".scratch\\m0\\_configs\\config_htdemucs_6stems__cdefs_b1.yaml",
+    "override": {
+      "chunk_s": 0.0,
+      "batch": 1
+    }
+  },
+  "drumsep": {
+    "model": "drumsep_htdemucs",
+    "wall_s": 68.7,
+    "vram_used_peak_mb": 5165,
+    "files": [
+      ".scratch\\m0\\stage2_drumsep\\stems\\cymbals.wav",
+      ".scratch\\m0\\stage2_drumsep\\stems\\kick.wav",
+      ".scratch\\m0\\stage2_drumsep\\stems\\snare.wav",
+      ".scratch\\m0\\stage2_drumsep\\stems\\toms.wav"
+    ],
+    "config_used": ".scratch\\m0\\_configs\\config_drumsep__cdefs_b1.yaml",
+    "override": {
+      "chunk_s": 0.0,
+      "batch": 1
+    }
+  },
+  "total_wall_s": 121.5
+}

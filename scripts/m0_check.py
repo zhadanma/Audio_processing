@@ -156,24 +156,58 @@ def _vram_sampler(stop: dict, result: dict) -> None:
     result["peak_mb"] = peak
 
 
-def run_msst(job: dict, src: Path, out_dir: Path, device_index: int = 0) -> dict:
+def config_variant(src: Path, out_dir: Path, chunk_s: float = 0.0, batch: int = 0,
+                   sample_rate: int = 44100) -> Path:
+    """生成推理配置变体，用于在显存受限时覆盖 chunk_size / batch_size。
+
+    MSST 的配置里 chunk_size(采样数) 与 inference.batch_size 决定单次前向的音频量：
+    DrumSep 默认 40 s × batch 8 = 320 s 音频，在 8 GB 卡上会打满显存并触发
+    WDDM 分页颠簸（GPU 100% 但功耗低、耗时暴涨数十倍）。此函数用于降配重测。
+    """
+    if not chunk_s and not batch:
+        return src
+
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.load(str(src))
+    if chunk_s:
+        cfg.audio.chunk_size = int(round(sample_rate * chunk_s))
+    if batch:
+        cfg.inference.batch_size = int(batch)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dst = out_dir / f"{src.stem}__c{chunk_s or 'def'}s_b{batch or 'def'}.yaml"
+    OmegaConf.save(cfg, str(dst))
+    return dst
+
+
+def run_msst(job: dict, src: Path, out_dir: Path, device: str = "cuda",
+             config_path: Path | None = None) -> dict:
+    # 所有传给 MSST 的路径必须是绝对路径：子进程的 cwd 会被切到 MSST 目录
+    src = Path(src).resolve()
+    out_dir = Path(out_dir).resolve()
     in_dir = out_dir / "input"
     stems_dir = out_dir / "stems"
     in_dir.mkdir(parents=True, exist_ok=True)
     stems_dir.mkdir(parents=True, exist_ok=True)
     target = in_dir / src.name
-    if target.resolve() != src.resolve():
+    if target != src:
         shutil.copy2(src, target)
 
     cmd = [
         sys.executable, str(MSST_DIR / "inference.py"),
         "--model_type", job["model_type"],
-        "--config_path", str(job["config"]),
-        "--start_check_point", str(job["weights"]),
+        "--config_path", str(Path(config_path or job["config"]).resolve()),
+        "--start_check_point", str(Path(job["weights"]).resolve()),
         "--input_folder", str(in_dir),
         "--store_dir", str(stems_dir),
-        "--device_ids", str(device_index),
+        # MSST 默认模板是 "{file_name}/{instr}"，会为每首歌建一层子目录；
+        # 这里改成扁平的 "{instr}.flac"，便于直接按 stem 名取文件
+        "--filename_template", "{instr}",
     ]
+    if device == "cpu":
+        cmd.append("--force_cpu")
+    else:
+        cmd += ["--device_ids", "0"]
     stop: dict = {}
     vram: dict = {}
     sampler = threading.Thread(target=_vram_sampler, args=(stop, vram), daemon=True)
@@ -190,7 +224,7 @@ def run_msst(job: dict, src: Path, out_dir: Path, device_index: int = 0) -> dict
         tail = (proc.stdout + "\n" + proc.stderr)[-3000:]
         raise RuntimeError(f"MSST 推理失败（{job['name']}）:\n{tail}")
 
-    files = sorted(str(p) for p in stems_dir.glob("*") if p.is_file())
+    files = sorted(str(p) for p in stems_dir.rglob("*") if p.is_file())
     return {
         "model": job["name"],
         "wall_s": round(elapsed, 1),
@@ -207,48 +241,94 @@ def main() -> None:
     ap.add_argument("--out", default=str(DEFAULT_OUT), help="输出目录")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     ap.add_argument("--drumsep", action="store_true", help="对 drums 轨追加 DrumSep 二级验证")
+    ap.add_argument("--stage1-chunk", type=float, default=0.0,
+                    help="阶段1 分块秒数（0=用配置默认）")
+    ap.add_argument("--stage1-batch", type=int, default=0,
+                    help="阶段1 推理批大小（0=用配置默认；8 GB 显存建议 1）")
+    ap.add_argument("--drumsep-chunk", type=float, default=0.0,
+                    help="DrumSep 分块秒数（0=用配置默认；8 GB 显存建议 20）")
+    ap.add_argument("--drumsep-batch", type=int, default=0,
+                    help="DrumSep 推理批大小（0=用配置默认；显存紧张建议 1）")
+    ap.add_argument("--reuse-stage1", metavar="DIR",
+                    help="跳过阶段1，直接复用该目录下的 drums stem 跑阶段2")
     args = ap.parse_args()
 
-    out_root = Path(args.out)
+    out_root = Path(args.out).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
     report: dict = {"env": env_report(args.device)}
 
-    if args.synthetic:
-        src = out_root / f"synthetic_{args.minutes:g}min.wav"
-        print(f"[m0] 生成合成测试音频 {src} ...")
-        gen_synthetic(src, args.minutes)
-    elif args.input:
-        src = Path(args.input).expanduser().resolve()
+    t_all = time.perf_counter()
+
+    if args.reuse_stage1:
+        src = Path(args.reuse_stage1).expanduser().resolve()
+        print(f"[m0] 复用阶段1结果: {src}")
+        report["input"] = {"reused_stage1": str(src)}
+        drums = next((p for p in sorted(src.rglob("drums.*")) if p.is_file()), None)
+        if drums is None:
+            raise SystemExit(f"在 {src} 下未找到 drums stem")
+        print(f"[m0] 鼓轨输入: {drums}（{drums.stat().st_size / 1024**2:.1f} MB）")
+        res1 = None
     else:
-        ap.error("需要 --input <音频文件> 或 --synthetic")
+        if args.synthetic:
+            src = out_root / f"synthetic_{args.minutes:g}min.wav"
+            print(f"[m0] 生成合成测试音频 {src} ...")
+            gen_synthetic(src, args.minutes)
+        elif args.input:
+            src = Path(args.input).expanduser().resolve()
+        else:
+            ap.error("需要 --input <音频文件> 或 --synthetic")
 
-    if not src.exists():
-        raise SystemExit(f"输入文件不存在: {src}")
+        if not src.exists():
+            raise SystemExit(f"输入文件不存在: {src}")
 
-    print(f"[m0] 输入音频: {src}")
-    report["input"] = audio_info(src)
-    print(f"[m0] 时长 {report['input']['duration_s']} s, "
-          f"{report['input']['sample_rate']} Hz, {report['input']['channels']} ch")
+        print(f"[m0] 输入音频: {src}")
+        report["input"] = audio_info(src)
+        print(f"[m0] 时长 {report['input']['duration_s']} s, "
+              f"{report['input']['sample_rate']} Hz, {report['input']['channels']} ch")
 
-    print("[m0] 阶段1: htdemucs_6s 六轨分离 ...")
-    res1 = run_msst(HTDEMUCS_6S, src, out_root / "stage1_htdemucs_6s")
-    report["htdemucs_6s"] = res1
-    print(f"[m0]   完成: {res1['wall_s']} s（含模型加载），显存峰值约 {res1['vram_used_peak_mb']} MB")
-    for f in res1["files"]:
-        info = audio_info(Path(f))
-        print(f"[m0]   - {Path(f).name}: {info['duration_s']} s")
+        print("[m0] 阶段1: htdemucs_6s 六轨分离 ...")
+        cfg1 = config_variant(
+            HTDEMUCS_6S["config"], out_root / "_configs",
+            chunk_s=args.stage1_chunk, batch=args.stage1_batch,
+            sample_rate=report["input"].get("sample_rate", 44100) or 44100,
+        )
+        if cfg1 != HTDEMUCS_6S["config"]:
+            print(f"[m0] 阶段1 使用降配配置: {cfg1.name}")
+        res1 = run_msst(HTDEMUCS_6S, src, out_root / "stage1_htdemucs_6s",
+                        device=report["env"]["device_used"], config_path=cfg1)
+        res1["config_used"] = str(cfg1)
+        res1["override"] = {"chunk_s": args.stage1_chunk, "batch": args.stage1_batch}
+        report["htdemucs_6s"] = res1
+        print(f"[m0]   完成: {res1['wall_s']} s（含模型加载），显存峰值约 {res1['vram_used_peak_mb']} MB")
+        for f in res1["files"]:
+            info = audio_info(Path(f))
+            print(f"[m0]   - {Path(f).name}: {info['duration_s']} s")
+
+        drums = next((Path(f) for f in res1["files"] if "drum" in Path(f).name.lower()), None)
 
     if args.drumsep:
-        drums = next((Path(f) for f in res1["files"] if "drum" in Path(f).name.lower()), None)
         if drums is None:
             raise SystemExit("未找到 drums stem，无法运行 DrumSep")
+        cfg_path = config_variant(
+            DRUMSEP["config"], out_root / "_configs",
+            chunk_s=args.drumsep_chunk, batch=args.drumsep_batch,
+            sample_rate=report.get("input", {}).get("sample_rate", 44100) or 44100,
+        )
+        if cfg_path != DRUMSEP["config"]:
+            print(f"[m0] DrumSep 使用降配配置: {cfg_path.name}")
         print(f"[m0] 阶段2: DrumSep 鼓组细分（输入 {drums.name}）...")
-        res2 = run_msst(DRUMSEP, drums, out_root / "stage2_drumsep")
+        res2 = run_msst(DRUMSEP, drums, out_root / "stage2_drumsep",
+                        device=report["env"]["device_used"], config_path=cfg_path)
+        res2["config_used"] = str(cfg_path)
+        res2["override"] = {"chunk_s": args.drumsep_chunk, "batch": args.drumsep_batch}
         report["drumsep"] = res2
         print(f"[m0]   完成: {res2['wall_s']} s，显存峰值约 {res2['vram_used_peak_mb']} MB")
         for f in res2["files"]:
-            print(f"[m0]   - {Path(f).name}")
+            info = audio_info(Path(f))
+            print(f"[m0]   - {Path(f).name}: {info['duration_s']} s")
+
+    report["total_wall_s"] = round(time.perf_counter() - t_all, 1)
 
     report_path = out_root / "report.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
